@@ -16,8 +16,15 @@ from tkinter import messagebox, ttk
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from xlsxwriter.utility import xl_col_to_name
 import traceback
+from pathlib import Path
+from utils.avery_labels import fill_avery_30up
 
 # ======================== Config ========================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # src/ -> project_root/
+OUTPUT_DIR = PROJECT_ROOT / "output"
+TEMPLATE_DIR = PROJECT_ROOT / "templates"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 COLUMNS_TO_DROP = ["Member First Name", "Member Last Name", "Member Username", "Listing Office", "Listing Agent", "MLS Name", "Folder"]
 COLUMNS_TO_MOVE = ["Email", "Address1", "Address2", "City", "State", "Zip", "Owner Mailing Address", "Owner Mailing City", "Owner Mailing State", "Owner Mailing Zip", "Tax Owner", "MLS Number"]
@@ -135,8 +142,23 @@ def convert_column_to_int(df, column):
     return df
 
 def apply_format_to_column(worksheet, df, column, fmt_obj):
-    for idx, _ in df[column].items():
-        worksheet.write(idx, df.columns.get_loc(column), df.at[idx, column], fmt_obj)
+    if column not in df.columns:
+        return
+    col_idx = df.columns.get_loc(column)
+    for row_idx in range(len(df)):
+        worksheet.write(row_idx + 1, col_idx, df.iloc[row_idx, col_idx], fmt_obj)
+
+
+def make_avery_label_entry(row : pd.Series) -> str:
+    first_name = row["First Name"]
+    last_name = row["Last Name"]
+    street = row["Address1"]
+    city = row["City"]
+    state = row["State"]
+    zip_code = row["Zip"]
+
+    string = f"{first_name} {last_name}\n{street}\n{city}, {state} {zip_code}"
+    return string
 
 def highlight_all_caps(ws, df, column_name, fmt, other_column=None):
     if column_name not in df.columns:
@@ -270,6 +292,20 @@ def clean_data(df):
     drop_and_reorder_columns(df)
     transform_columns(df)
     drop_empty_columns(df)
+
+
+    labels = []
+    for index, row in df.iterrows():
+        if index >= 30:
+            break
+        labels.append(make_avery_label_entry(row))
+
+    fill_avery_30up(
+        template_path=str(TEMPLATE_DIR / "Avery5160AddressLabels.docx"),
+        output_path=str(OUTPUT_DIR / "filled_labels.docx"),
+        labels = labels
+    )
+
     return df
 
 def format_phones(df):
@@ -280,12 +316,11 @@ def format_phones(df):
 def classify_dnc(df):
     global DNC_NUMBERS, NON_DNC_NUMBERS
     DNC_NUMBERS, NON_DNC_NUMBERS = {}, {}
+    # In classify_dnc, instead of building DNC_NUMBERS/NON_DNC_NUMBERS dicts:
     for i in range(1, 6):
         col = "Phone" if i == 1 else f"Phone {i}"
         dnc_col = f"{col} DNC Status"
-        DNC_NUMBERS[col], NON_DNC_NUMBERS[col] = [], []
-        for row_num, val in enumerate(df[dnc_col], start=1):
-            (DNC_NUMBERS if val == 'DNC' else NON_DNC_NUMBERS)[col].append(row_num)
+        df[f"_dnc_{col}"] = df[dnc_col] == "DNC"
         df.drop(dnc_col, axis=1, inplace=True)
 
 def append_phone_types(df):
@@ -301,19 +336,11 @@ def append_phone_types(df):
         df.drop(type_col, axis=1, inplace=True)
 
 def restrict_emails(df):
-    global RESTRICTED_EMAILS
-    RESTRICTED_EMAILS = {"Email": []}
-    for idx, val in enumerate(df["Email Status"], start=1):
-        if val == 'Restricted':
-            RESTRICTED_EMAILS["Email"].append(idx)
+    df["_restricted_email"] = df["Email Status"] == "Restricted"
     df.drop("Email Status", axis=1, inplace=True)
 
 def flag_commercial(df):
-    global COMMERCIAL_SALES
-    COMMERCIAL_SALES = {"Property Type": []}
-    for idx, val in enumerate(df["Property Type"], start=1):
-        if val == 'Commercial Sale':
-            COMMERCIAL_SALES["Property Type"].append(idx)
+    df["_commercial"] = df["Property Type"] == "Commercial Sale"
 
 def drop_and_reorder_columns(df):
     df.drop(COLUMNS_TO_DROP, axis=1, inplace=True)
@@ -330,11 +357,6 @@ def transform_columns(df):
     df["Owner Mailing State"] = df["Owner Mailing State"].apply(convert_state_abbreviation)
     df["List Price"] = df["List Price"].astype(float)
 
-    # for col in ["Date Added", "Status Change Date"]:
-    #     if col in df.columns:
-    #         df[col] = pd.to_datetime(df[col], errors="coerce").dt.normalize()
-    #         # or: .dt.date (see note below)
-
     for col in CONVERT_TO_INT:
         df = convert_column_to_int(df, col)
 
@@ -343,66 +365,6 @@ def drop_empty_columns(df):
     df.drop(columns=empty_cols, inplace=True)
 
 # ======================== Excel Output ========================
-# def export_to_excel(df, output_file):
-#     writer = pd.ExcelWriter(
-#         output_file,
-#         engine="xlsxwriter",
-#         engine_kwargs={"options": {"nan_inf_to_errors": True}}
-#     )
-#
-#     df.to_excel(writer, sheet_name="Sheet1", index=False)
-#
-#     workbook = writer.book
-#     worksheet = writer.sheets["Sheet1"]
-#
-#     # Format setup
-#     yellow = workbook.add_format({"bg_color": "#FFFF00"})
-#     red = workbook.add_format({"bg_color": "#FF9999"})
-#     currency = workbook.add_format({'num_format': '[$$-409]#,##0.00'})
-#     comma = workbook.add_format({'num_format': '#,##0'})
-#     caps_highlight = workbook.add_format({
-#         "bg_color": "#F0E269",
-#         "font_color": "#006100"
-#     })
-#     date_only = workbook.add_format({
-#         "num_format": "mm/dd/yyyy"
-#     })
-#
-#     # Email hyperlinks
-#     email_col = ""
-#
-#     try:
-#         email_col = column_number_to_letter(df.columns.get_loc("Email"))
-#     except Exception as e:
-#         pass
-#
-#     if email_col:
-#         for row_num, email in enumerate(df["Email"], start=2):
-#             if email:
-#                 worksheet.write_url(f"{email_col}{row_num}", f"mailto:{email}")
-#
-#     # Color DNC and Commercials
-#     color_rows(worksheet, df, DNC_NUMBERS, red)
-#     color_rows(worksheet, df, NON_DNC_NUMBERS, yellow)
-#     color_rows(worksheet, df, RESTRICTED_EMAILS, red, email=True)
-#     color_rows(worksheet, df, COMMERCIAL_SALES, yellow)
-#
-#     # Apply formatting
-#     apply_format_to_column(worksheet, df, "List Price", currency)
-#     apply_format_to_column(worksheet, df, "Square Footage", comma)
-#     # apply_format_to_column(worksheet, df, "Date Added", date_only)
-#     # apply_format_to_column(worksheet, df, "Status Change Date", date_only)
-#
-#     auto_adjust_columns(worksheet, df)
-#     add_excel_table(worksheet, df, date_only)
-#     hide_specified_columns(worksheet, df)
-#     highlight_all_caps(worksheet, df, "First Name", caps_highlight, other_column="Last Name")
-#
-#     set_column_date_only(worksheet, df, "Date Added", date_only)
-#     set_column_date_only(worksheet, df, "Status Change Date", date_only)
-#
-#     writer.close()
-#
 
 def export_to_excel(df, output_file):
     # -------- entity split (presentation only) --------
@@ -442,35 +404,6 @@ def export_to_excel(df, output_file):
         "Main": df[~entity_mask & ~duplicate_mask].copy(),
         "Companies": df[entity_mask].copy()
     }
-    # for key in duplicate_keys:
-    #     fn, ln = key.split("|")
-    #
-    #     sheet_df = df[df["_name_key"] == key].copy()
-    #     sheet_df.drop(columns="_name_key", inplace=True)
-    #     sheet_df.reset_index(drop=True, inplace=True)
-    #
-    #     # Excel sheet name rules:
-    #     base_name = f"{fn.title()} {ln.title()}"[:31]
-    #     sheet_name = make_unique_sheet_name(base_name, sheets)
-    #
-    #     sheets[sheet_name] = sheet_df
-
-    # for key in duplicate_keys:
-    #     fn, ln = key.split("|")
-    #
-    #     sheet_df = df[
-    #         df.apply(
-    #             lambda row: key in make_name_keys(row),
-    #             axis=1
-    #         )
-    #     ].copy()
-    #
-    #     sheet_df.reset_index(drop=True, inplace=True)
-    #
-    #     base_name = f"{fn.title()} {ln.title()}"[:31]
-    #     sheet_name = make_unique_sheet_name(base_name, sheets)
-    #
-    #     sheets[sheet_name] = sheet_df
 
     for key in duplicate_keys:
         fn, ln = key.split("|")
@@ -500,7 +433,10 @@ def export_to_excel(df, output_file):
             continue
 
         # ---- ORIGINAL BEHAVIOR STARTS HERE ----
-        sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        flag_cols = [c for c in sheet_df.columns if c.startswith("_")]
+        display_df = sheet_df.drop(columns=flag_cols)
+        display_df.to_excel(writer, sheet_name=sheet_name, index=False)
         worksheet = writer.sheets[sheet_name]
 
         # Format setup (UNCHANGED)
@@ -519,52 +455,29 @@ def export_to_excel(df, output_file):
         # Email hyperlinks (UNCHANGED)
         email_col = ""
         try:
-            email_col = column_number_to_letter(sheet_df.columns.get_loc("Email"))
+            email_col = column_number_to_letter(display_df.columns.get_loc("Email"))
         except Exception:
             pass
 
         if email_col:
-            for row_num, email in enumerate(sheet_df["Email"], start=2):
+            for row_num, email in enumerate(display_df["Email"], start=2):
                 if email:
                     worksheet.write_url(f"{email_col}{row_num}", f"mailto:{email}")
 
-        # Color DNC and Commercials (UNCHANGED)
-        color_rows(worksheet, sheet_df, DNC_NUMBERS, red)
-        color_rows(worksheet, sheet_df, NON_DNC_NUMBERS, yellow)
-        color_rows(worksheet, sheet_df, RESTRICTED_EMAILS, red, email=True)
-        color_rows(worksheet, sheet_df, COMMERCIAL_SALES, yellow)
+        color_rows_from_flags(worksheet, display_df, sheet_df, red, yellow, red, yellow)
 
-        # Apply formatting (UNCHANGED)
-        apply_format_to_column(worksheet, sheet_df, "List Price", currency)
-        apply_format_to_column(worksheet, sheet_df, "Square Footage", comma)
+        apply_format_to_column(worksheet, display_df, "List Price", currency)
+        apply_format_to_column(worksheet, display_df, "Square Footage", comma)
+        auto_adjust_columns(worksheet, display_df)
+        add_excel_table(worksheet, display_df, date_only)
+        hide_specified_columns(worksheet, display_df)
+        highlight_all_caps(worksheet, display_df, "First Name", caps_highlight, other_column="Last Name")
+        set_column_date_only(worksheet, display_df, "Date Added", date_only)
+        set_column_date_only(worksheet, display_df, "Status Change Date", date_only)
 
-        auto_adjust_columns(worksheet, sheet_df)
-        add_excel_table(worksheet, sheet_df, date_only)
-        hide_specified_columns(worksheet, sheet_df)
-
-        highlight_all_caps(
-            worksheet,
-            sheet_df,
-            "First Name",
-            caps_highlight,
-            other_column="Last Name"
-        )
-
-        set_column_date_only(worksheet, sheet_df, "Date Added", date_only)
-        set_column_date_only(worksheet, sheet_df, "Status Change Date", date_only)
         # ---- ORIGINAL BEHAVIOR ENDS HERE ----
 
     writer.close()
-
-
-# def color_rows(ws, df, data_dict, fmt, email=False):
-#     for col, rows in data_dict.items():
-#         if col not in df.columns:
-#             continue
-#         for row in rows:
-#             value = f"mailto:{df.at[row - 1, col]}" if email else df.at[row - 1, col]
-#             if pd.notna(value):
-#                 ws.write(row, df.columns.get_loc(col), value, fmt)
 
 def color_rows(ws, df, data_dict, fmt, email=False):
     for col, rows in data_dict.items():
@@ -584,6 +497,35 @@ def color_rows(ws, df, data_dict, fmt, email=False):
             if pd.notna(value):
                 ws.write(row, df.columns.get_loc(col), value, fmt)
 
+def color_rows_from_flags(ws, display_df, flag_df, fmt_dnc, fmt_non_dnc, fmt_restricted, fmt_commercial):
+    for i in range(1, 6):
+        col = "Phone" if i == 1 else f"Phone {i}"
+        flag_col = f"_dnc_{col}"
+        if flag_col not in flag_df.columns or col not in display_df.columns:
+            continue
+        col_idx = display_df.columns.get_loc(col)
+        for row_idx in range(len(display_df)):
+            val = display_df.iloc[row_idx][col]
+            if pd.notna(val):
+                fmt = fmt_dnc if flag_df.iloc[row_idx][flag_col] else fmt_non_dnc
+                ws.write(row_idx + 1, col_idx, val, fmt)
+
+    if "_restricted_email" in flag_df.columns and "Email" in display_df.columns:
+        col_idx = display_df.columns.get_loc("Email")
+        for row_idx in range(len(display_df)):
+            if flag_df.iloc[row_idx]["_restricted_email"]:
+                val = display_df.iloc[row_idx]["Email"]
+                if pd.notna(val):
+                    ws.write(row_idx + 1, col_idx, f"mailto:{val}", fmt_restricted)
+
+    if "_commercial" in flag_df.columns and "Property Type" in display_df.columns:
+        col_idx = display_df.columns.get_loc("Property Type")
+        for row_idx in range(len(display_df)):
+            if flag_df.iloc[row_idx]["_commercial"]:
+                val = display_df.iloc[row_idx]["Property Type"]
+                if pd.notna(val):
+                    ws.write(row_idx + 1, col_idx, val, fmt_commercial)
+
 
 def auto_adjust_columns(ws, df):
     for col_num, col_name in enumerate(df.columns):
@@ -600,29 +542,6 @@ def auto_adjust_columns(ws, df):
             max_len += COLUMN_PADDING[col_name]
 
         ws.set_column(col_num, col_num, max_len)
-
-
-# def add_excel_table(ws, df):
-#     rows, cols = len(df) + 1, len(df.columns)
-#     col_letter = xl_col_to_name(cols - 1)
-#     ws.add_table(f"A1:{col_letter}{rows}", {
-#         "columns": [{"header": col} for col in df.columns],
-#         "autofilter": True,
-#         "style": "Table Style Medium 9"
-#     })
-
-# def add_excel_table(ws, df):
-#     rows, cols = len(df) + 1, len(df.columns)
-#     col_letter = xl_col_to_name(cols - 1)
-#
-#     ws.add_table(f"A1:{col_letter}{rows}", {
-#         "columns": [
-#             {"header": EXCEL_COLUMN_RENAMES.get(col, col)}
-#             for col in df.columns
-#         ],
-#         "autofilter": True,
-#         "style": "Table Style Medium 9"
-#     })
 
 def add_excel_table(ws, df, date_fmt):
     rows, cols = len(df) + 1, len(df.columns)
@@ -653,33 +572,6 @@ def hide_specified_columns(ws, df):
         ws.set_column(f"{letter}:{letter}", None, None, {"hidden": True})
 
 # ======================== Run Pipeline ========================
-# def main():
-#     df = pd.read_csv(INPUT_FILE)
-#     df = clean_data(df)
-#     print("Final Column Count:", len(df.columns))
-#     export_to_excel(df)
-#
-# if __name__ == "__main__":
-#     main()
-
-
-# def process_csv(csv_path):
-#     try:
-#         df = pd.read_csv(csv_path)
-#         df = clean_data(df)
-#
-#         base, _ = os.path.splitext(csv_path)
-#         output_path = base + ".xlsx"
-#
-#         export_to_excel(df, output_path)
-#
-#         messagebox.showinfo(
-#             "Success",
-#             f"File cleaned successfully!\n\nSaved as:\n{output_path}"
-#         )
-#
-#     except Exception as e:
-#         messagebox.showerror("Error", str(e))
 
 def process_csv(csv_path, progress):
     try:
@@ -720,83 +612,128 @@ def process_csv(csv_path, progress):
         )
 
 # def on_drop(event):
-#     # Windows sometimes wraps paths in {}
 #     path = event.data.strip("{}")
 #
 #     if not path.lower().endswith(".csv"):
 #         messagebox.showerror("Invalid File", "Please drop a CSV file.")
 #         return
 #
-#     process_csv(path)
-
-def on_drop(event):
-    path = event.data.strip("{}")
-
-    if not path.lower().endswith(".csv"):
-        messagebox.showerror("Invalid File", "Please drop a CSV file.")
-        return
-
-    threading.Thread(
-        target=process_csv,
-        args=(path, progress_bar),
-        daemon=True
-    ).start()
-
-
-
-# def launch_gui():
-#     root = TkinterDnD.Tk()
-#     root.title("CSV Cleaner")
-#     root.geometry("420x180")
-#     root.resizable(False, False)
-#
-#     label = tk.Label(
-#         root,
-#         text="Drag & drop your CSV file here",
-#         font=("Segoe UI", 12),
-#         relief="ridge",
-#         borderwidth=2,
-#         width=40,
-#         height=6
-#     )
-#     label.pack(padx=20, pady=30)
-#
-#     label.drop_target_register(DND_FILES)
-#     label.dnd_bind("<<Drop>>", on_drop)
-#
-#     root.mainloop()
+#     threading.Thread(
+#         target=process_csv,
+#         args=(path, progress_bar),
+#         daemon=True
+#     ).start()
 
 def launch_gui():
     root = TkinterDnD.Tk()
     root.title("CSV Cleaner")
-    root.geometry("420x220")
+    root.geometry("420x300")
     root.resizable(False, False)
+
+    mode_var = tk.StringVar(value="clean")
+
+    mode_frame = tk.Frame(root)
+    mode_frame.pack(pady=(15, 0))
+
+    tk.Label(mode_frame, text="Mode:", font=("Segoe UI", 10)).pack(side="left", padx=(0, 8))
+    tk.Radiobutton(mode_frame, text="Clean CSV → Excel", variable=mode_var,
+                   value="clean", font=("Segoe UI", 10)).pack(side="left", padx=4)
+    tk.Radiobutton(mode_frame, text="Excel → Recipients CSV", variable=mode_var,
+                   value="recipients", font=("Segoe UI", 10)).pack(side="left", padx=4)
+
+    hint_var = tk.StringVar(value="Drag & drop your CSV file here")
+
+    def on_mode_change(*_):
+        if mode_var.get() == "clean":
+            hint_var.set("Drag & drop your CSV file here")
+        else:
+            hint_var.set("Drag & drop your cleaned .xlsx file here")
+
+    mode_var.trace_add("write", on_mode_change)
 
     label = tk.Label(
         root,
-        text="Drag & drop your CSV file here",
+        textvariable=hint_var,
         font=("Segoe UI", 12),
         relief="ridge",
         borderwidth=2,
         width=40,
         height=6
     )
-    label.pack(padx=20, pady=(20, 10))
+    label.pack(padx=20, pady=(12, 10))
+
+    def extract_recipients_csv(xlsx_path, progress):
+        try:
+            progress.pack(pady=10)
+            progress.start(10)
+
+            xl = pd.ExcelFile(xlsx_path)
+            if "Main" not in xl.sheet_names:
+                raise ValueError("No 'Main' sheet found in this workbook.")
+
+            df = pd.read_excel(xlsx_path, sheet_name="Main")
+
+            # Reverse the display renames back to original column names
+            reverse_renames = {v: k for k, v in EXCEL_COLUMN_RENAMES.items()}
+            df.rename(columns=reverse_renames, inplace=True)
+
+            # Require email
+            df = df[df["Email"].notna() & (df["Email"].astype(str).str.strip() != "")]
+
+            out = pd.DataFrame()
+            out["email"] = df["Email"].astype(str).str.strip()
+
+            if "First Name" in df.columns and "Last Name" in df.columns:
+                out["name"] = (
+                        df["First Name"].fillna("").astype(str).str.strip()
+                        + " "
+                        + df["Last Name"].fillna("").astype(str).str.strip()
+                ).str.strip()
+            elif "First Name" in df.columns:
+                out["name"] = df["First Name"].fillna("").astype(str).str.strip()
+
+            # Pull in other useful columns if they exist
+            for col in ["Phone", "Address1", "City", "State", "Zip",
+                        "Tax Owner", "List Price", "MLS Number"]:
+                if col in df.columns:
+                    out[col.lower().replace(" ", "_")] = df[col]
+
+            base = os.path.splitext(xlsx_path)[0]
+            output_path = base + "_recipients.csv"
+            out.to_csv(output_path, index=False, encoding="utf-8")
+
+            progress.stop()
+            progress.pack_forget()
+            messagebox.showinfo(
+                "Success",
+                f"Recipients CSV created!\n{len(out)} rows exported.\n\nSaved as:\n{output_path}"
+            )
+
+        except Exception as e:
+            progress.stop()
+            progress.pack_forget()
+            tb = traceback.format_exc()
+            messagebox.showerror("Error", f"{type(e).__name__}: {e}\n\nTraceback:\n{tb}")
+
+    def on_drop(event):
+        path = event.data.strip("{}")
+        if mode_var.get() == "clean":
+            if not path.lower().endswith(".csv"):
+                messagebox.showerror("Invalid File", "Please drop a CSV file.")
+                return
+            threading.Thread(target=process_csv, args=(path, progress_bar), daemon=True).start()
+        else:
+            if not path.lower().endswith(".xlsx"):
+                messagebox.showerror("Invalid File", "Please drop an .xlsx file.")
+                return
+            threading.Thread(target=extract_recipients_csv, args=(path, progress_bar), daemon=True).start()
 
     label.drop_target_register(DND_FILES)
     label.dnd_bind("<<Drop>>", on_drop)
 
     global progress_bar
-    progress_bar = ttk.Progressbar(
-        root,
-        mode="indeterminate",
-        length=360
-    )
-    # run loop
+    progress_bar = ttk.Progressbar(root, mode="indeterminate", length=360)
     root.mainloop()
-
-
-
 
 if __name__ == "__main__":
     launch_gui()
